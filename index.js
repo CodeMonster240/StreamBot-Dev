@@ -25,11 +25,10 @@ let liveMessage = null;
 let errorAlertMessage = null;
 let updateInterval = null;
 let detectedPaths = [];
-let globalBrowser = null; // Reused browser instance to minimize CPU spikes
+let globalBrowser = null;
 
 /**
- * Returns an existing Chromium instance or launches a new one if not running.
- * Reusing a single browser instance reduces CPU consumption by ~80%.
+ * Returns a shared Chromium instance to prevent CPU spikes from launching processes repeatedly.
  */
 async function getBrowserInstance() {
   if (!globalBrowser || !globalBrowser.isConnected()) {
@@ -56,7 +55,8 @@ async function getBrowserInstance() {
         '--disable-features=Translate,BackForwardCache,AcceptCHFrame,MediaRouter,OptimizationHints',
         '--disable-ipc-flooding-protection',
         '--disable-renderer-backgrounding',
-        '--mute-audio'
+        '--mute-audio',
+        '--blink-settings=imagesEnabled=true'
       ]
     });
   }
@@ -64,8 +64,7 @@ async function getBrowserInstance() {
 }
 
 /**
- * Dynamically builds Discord ActionRows/Buttons based on scraped webpage paths.
- * Falls back to default paths (/admin, /feedback, /pricing) if no <a> tags are detected.
+ * Dynamically builds Discord ActionRows/Buttons. Includes a manual 'Refresh' button to avoid heavy polling.
  */
 function createDynamicButtons() {
   const components = [];
@@ -74,13 +73,22 @@ function createDynamicButtons() {
     ? detectedPaths 
     : ['/admin', '/feedback', '/pricing'];
 
-  let currentButtons = [
+  // Row 1: Home & Refresh controls
+  let row1 = [
     new ButtonBuilder()
       .setCustomId('nav_/')
       .setLabel('🏠 Home')
-      .setStyle(currentPath === '/' ? ButtonStyle.Success : ButtonStyle.Primary)
+      .setStyle(currentPath === '/' ? ButtonStyle.Success : ButtonStyle.Primary),
+    new ButtonBuilder()
+      .setCustomId('action_refresh')
+      .setLabel('🔄 Refresh Feed')
+      .setStyle(ButtonStyle.Secondary)
   ];
 
+  components.push(new ActionRowBuilder().addComponents(row1));
+
+  // Row 2+: Scraped page links
+  let currentButtons = [];
   for (const path of activePaths) {
     const safePath = path.substring(0, 80); 
     const label = path.replace(/^\//, '').replace(/-/g, ' ') || 'Page';
@@ -196,7 +204,6 @@ client.on('interactionCreate', async (interaction) => {
         .setColor(0x3498DB)
         .setFooter({ text: 'Initializing browser & scanning links...' });
 
-      // Clean up previous messages if restarting
       if (liveMessage) try { await liveMessage.delete(); } catch {}
       if (errorAlertMessage) try { await errorAlertMessage.delete(); } catch {}
 
@@ -206,8 +213,8 @@ client.on('interactionCreate', async (interaction) => {
       if (updateInterval) clearInterval(updateInterval);
 
       await updateFeed();
-      // Increased interval from 10s to 15s to lighten CPU load
-      updateInterval = setInterval(updateFeed, 15000);
+      // Increased auto-refresh to 60 seconds to prevent host CPU throttling
+      updateInterval = setInterval(updateFeed, 60000);
     }
 
     if (commandName === 'page') {
@@ -237,6 +244,12 @@ client.on('interactionCreate', async (interaction) => {
       });
     }
 
+    if (interaction.customId === 'action_refresh') {
+      await interaction.reply({ content: '🔄 Refreshing live preview...', flags: MessageFlags.Ephemeral });
+      await updateFeed();
+      return;
+    }
+
     if (interaction.customId.startsWith('nav_')) {
       currentPath = interaction.customId.replace('nav_', '');
       
@@ -251,7 +264,7 @@ client.on('interactionCreate', async (interaction) => {
 });
 
 /**
- * Renders the webpage via Puppeteer, extracts anchor tags, and updates the Discord embed.
+ * Highly optimized capture method using request filtering and JPEG compression.
  */
 async function updateFeed() {
   if (!baseUrl || !liveMessage) return;
@@ -263,15 +276,26 @@ async function updateFeed() {
     const browser = await getBrowserInstance();
     page = await browser.newPage();
     
-    await page.setViewport({ width: 1280, height: 720 });
+    // CPU Optimization 1: Reduced Viewport Resolution (960x540)
+    await page.setViewport({ width: 960, height: 540 });
     await page.setExtraHTTPHeaders({ 'ngrok-skip-browser-warning': 'true' });
-    page.setDefaultNavigationTimeout(20000);
+    page.setDefaultNavigationTimeout(15000);
 
-    // Fast DOM load wait
+    // CPU Optimization 2: Block unused assets (fonts, media) to cut render complexity
+    await page.setRequestInterception(true);
+    page.on('request', (req) => {
+      const resourceType = req.resourceType();
+      if (['font', 'media'].includes(resourceType)) {
+        req.abort();
+      } else {
+        req.continue();
+      }
+    });
+
     await page.goto(targetUrl, { waitUntil: 'domcontentloaded' });
-    await new Promise(resolve => setTimeout(resolve, 800));
+    await new Promise(resolve => setTimeout(resolve, 500));
 
-    // Scrape valid internal <a> links on the current DOM
+    // Scrape valid internal <a> links on current DOM
     const scrapedPaths = await page.evaluate(() => {
       return Array.from(document.querySelectorAll('a'))
         .map(a => a.pathname)
@@ -280,22 +304,26 @@ async function updateFeed() {
 
     detectedPaths = [...new Set(scrapedPaths)].slice(0, 9);
 
-    const screenshotBuffer = await page.screenshot({ type: 'png' });
-    await page.close(); // Close tab, keep browser instance running in background
+    // CPU Optimization 3: Use JPEG instead of PNG to eliminate Zlib CPU spikes
+    const screenshotBuffer = await page.screenshot({ 
+      type: 'jpeg', 
+      quality: 50 
+    });
+    
+    await page.close();
 
-    // If site restored, remove error message
     if (errorAlertMessage) {
       try { await errorAlertMessage.delete(); } catch {}
       errorAlertMessage = null;
     }
 
-    const attachment = new AttachmentBuilder(screenshotBuffer, { name: 'preview.png' });
+    const attachment = new AttachmentBuilder(screenshotBuffer, { name: 'preview.jpg' });
 
     const updatedEmbed = new EmbedBuilder()
       .setTitle('🌐 StreamBot Dev - Live Feed')
       .setDescription(`Current View: [${targetUrl}](${targetUrl})`)
       .setColor(0x2ECC71)
-      .setImage('attachment://preview.png')
+      .setImage('attachment://preview.jpg')
       .setFooter({ text: `Auto-refreshed at ${new Date().toLocaleTimeString()} | Path: ${currentPath}` });
 
     await liveMessage.edit({
@@ -308,12 +336,10 @@ async function updateFeed() {
     console.error(`[Error loading ${targetUrl}]:`, error.message);
     if (page) try { await page.close(); } catch {}
     
-    // Force browser re-initialization if browser crashed or disconnected
     if (globalBrowser && !globalBrowser.isConnected()) {
       globalBrowser = null;
     }
 
-    // Post connection error alert without destroying the last good snapshot
     if (targetChannelId && !errorAlertMessage) {
       const channel = await client.channels.fetch(targetChannelId);
       const errorEmbed = new EmbedBuilder()
