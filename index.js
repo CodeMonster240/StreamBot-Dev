@@ -222,9 +222,11 @@ async function updateFeed() {
   let browser;
 
   try {
-    // Optimized Puppeteer launch arguments for container hosts (bot-hosting.net, Docker, etc.)
+    // Optimized Puppeteer launch options with increased protocolTimeout for low-resource hosts
     browser = await puppeteer.launch({ 
       headless: 'new',
+      protocolTimeout: 120000, // 120 seconds for CDP commands to respond
+      timeout: 120000,         // 120 seconds browser launch timeout
       args: [
         '--no-sandbox',
         '--disable-setuid-sandbox',
@@ -234,9 +236,17 @@ async function updateFeed() {
         '--no-zygote',
         '--single-process',
         '--disable-gpu',
-        '--remote-debugging-port=0'
-      ],
-      timeout: 60000
+        '--remote-debugging-port=0',
+        '--disable-background-networking',
+        '--disable-background-timer-throttling',
+        '--disable-backgrounding-occluded-windows',
+        '--disable-breakpad',
+        '--disable-component-extensions-with-background-pages',
+        '--disable-extensions',
+        '--disable-features=Translate,BackForwardCache,AcceptCHFrame,MediaRouter,OptimizationHints',
+        '--disable-ipc-flooding-protection',
+        '--disable-renderer-backgrounding'
+      ]
     });
     
     const page = await browser.newPage();
@@ -244,7 +254,7 @@ async function updateFeed() {
     
     // Bypass Ngrok warning screen if using ngrok tunnel
     await page.setExtraHTTPHeaders({ 'ngrok-skip-browser-warning': 'true' });
-    page.setDefaultNavigationTimeout(15000);
+    page.setDefaultNavigationTimeout(20000);
 
     // Fast DOM load wait
     await page.goto(targetUrl, { waitUntil: 'domcontentloaded' });
